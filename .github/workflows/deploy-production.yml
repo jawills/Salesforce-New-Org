@@ -1,32 +1,105 @@
 name: Close Production Pull Request
 
-# only trigger on pull request closed events
 on:
   pull_request:
-    types: [ closed ]
+    types: [closed]
     branches:
       - master
+      - main
     paths:
-      - 'force-app/**'
+      - "force-app/**"
+
+permissions:
+  contents: read
+
 jobs:
   merge_job:
     environment: production
-    # this job will only run if the PR has been merged
     if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v3
-    - name: Deploy on Production
-      uses: jawills/sf-deploy@v1.0
-      with:
-        SFDX_AUTH_URL: ${{ secrets.SFDX_AUTH_URL }}
-        DRY_RUN: false
-        TEST_LEVEL: RunLocalTests
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install Salesforce CLI and sfdx-git-delta
+        run: |
+          set -euo pipefail
+          npm install -g @salesforce/cli
+          echo y | sf plugins install sfdx-git-delta
+
+      - name: Build merged PR metadata delta (sfdx-git-delta)
+        id: delta
+        run: |
+          set -euo pipefail
+          FROM="${{ github.event.pull_request.base.sha }}"
+          TO="${{ github.event.pull_request.head.sha }}"
+          mkdir -p deltas
+          sf sgd source delta \
+            --from "$FROM" \
+            --to "$TO" \
+            --output-dir deltas \
+            --generate-delta \
+            --ignore-file .forceignore \
+            --source-dir force-app
+
+          HAS_PKG=false
+          HAS_DES=false
+          if [ -f deltas/package/package.xml ] && grep -q '<members>' deltas/package/package.xml; then
+            HAS_PKG=true
+          fi
+          if [ -f deltas/destructiveChanges/destructiveChanges.xml ] && grep -q '<members>' deltas/destructiveChanges/destructiveChanges.xml; then
+            HAS_DES=true
+          fi
+          if [ "$HAS_PKG" != true ] && [ "$HAS_DES" != true ]; then
+            echo "empty_delta=true" >> "$GITHUB_OUTPUT"
+            echo "destructive_path=" >> "$GITHUB_OUTPUT"
+            echo "::notice::No metadata members in SGD package or destructive manifests — skipping production deploy."
+          else
+            echo "empty_delta=false" >> "$GITHUB_OUTPUT"
+            if [ "$HAS_DES" = true ]; then
+              echo "destructive_path=deltas/destructiveChanges/destructiveChanges.xml" >> "$GITHUB_OUTPUT"
+            else
+              echo "destructive_path=" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: Verify delta package manifest exists
+        if: steps.delta.outputs.empty_delta == 'false'
+        run: |
+          set -euo pipefail
+          test -f deltas/package/package.xml || { echo "::error::Missing deltas/package/package.xml after SGD. Cannot deploy delta."; exit 1; }
+
+      - name: Deploy summary (empty delta)
+        if: steps.delta.outputs.empty_delta == 'true'
+        run: |
+          bash .github/scripts/sf-deploy-summarize.sh deploy "${{ vars.ENVIRONMENT_NAME }}" deltas ""
+
+      - name: Deploy delta to ${{ vars.ENVIRONMENT_NAME }}
+        id: production-deploy
+        if: steps.delta.outputs.empty_delta != 'true'
+        uses: jawills/sf-deploy@v2
+        with:
+          SFDX_AUTH_URL: ${{ secrets.SFDX_AUTH_URL }}
+          DRY_RUN: false
+          TEST_LEVEL: RunLocalTests
+          MANIFEST_PATH: deltas/package/package.xml
+          POST_DESTRUCTIVE_CHANGES: ${{ steps.delta.outputs.destructive_path }}
+
+      - name: Deploy summary (result)
+        if: always() && steps.delta.outputs.empty_delta == 'false'
+        run: |
+          if [ -f resume-result.json ]; then
+            bash .github/scripts/sf-deploy-summarize.sh deploy "${{ vars.ENVIRONMENT_NAME }}" deltas resume-result.json
+          else
+            echo "## Salesforce deploy — ${{ vars.ENVIRONMENT_NAME }}" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "_No resume-result.json (deploy step may have failed before writing output)._" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   close_job:
-    # this job will only run if the PR has been closed without being merged
     if: github.event.pull_request.merged == false
     runs-on: ubuntu-latest
     steps:
-    - run: |
-        echo PR #${{ github.event.number }} has been closed without being merge
+      - run: |
+          echo "PR #${{ github.event.number }} has been closed without being merged"
