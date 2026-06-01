@@ -1,0 +1,80 @@
+name: Salesforce Incremental Metadata Deploy To Environment
+description: Builds and deploys metadata to a specified environment based on the previous git commits.
+author: jawills
+branding:
+  icon: code
+  color: green
+
+inputs:
+  DRY_RUN:
+    description: "Validate deploy and run Apex tests but don't save to the org."
+    type: boolean
+  BASE_REF:
+    description: "Start of commit"
+    type: string
+    required: true
+  TARGET_REF:
+    description: "End of commit"
+    type: string
+    required: true
+  SFDX_AUTH_URL:
+    description: "The auth url tied to your deployment environment"
+    type: string
+    required: true
+  TEST_LEVEL:
+    description: "Deployment Apex testing level."
+    type: choice
+    default: RunLocalTests
+    options:
+      - NoTestRun
+      - RunSpecifiedTests
+      - RunLocalTests
+      - RunAllTestsInOrg
+  WAIT:
+    description: "Number of minutes to wait for command to complete and display results."
+    type: number
+    default: 30
+  SOURCE_DIRECTORY:
+    description: "Path to the local source files to deploy."
+    type: string
+    default: force-app
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install Salesforce CLI
+      shell: bash
+      run: |
+        npm install -g @salesforce/cli
+        sf --version
+    - name: Login to Environment
+      shell: bash
+      run: |
+        sf org login sfdx-url --set-default --sfdx-url-file <(echo "${{ inputs.SFDX_AUTH_URL }}")
+    - name: Generate package.xml
+      shell: bash
+      run: |
+        echo y | sf plugins:install sfdx-git-delta
+        if [ "${{ inputs.validateOnly }}" = "true" ]; then
+          git merge "${{ inputs.baseRef }}"
+        fi
+        mkdir -p deltas
+        sfdx sgd source delta --from "${{ inputs.BASE_REF }}" --to "${{ inputs.TARGET_REF }}" --output deltas --generate-delta --ignore .forceignore
+        echo "# package.xml"
+        cat deltas/package/package.xml; echo ""
+        echo "# destructiveChanges.xml"
+        cat deltas/destructiveChanges/destructiveChanges.xml; echo ""
+    - name: Deploy to Environment
+      shell: bash
+      run: |
+        deployFlags=(
+          --manifest deltas/package/package.xml
+          --post-destructive-changes deltas/destructiveChanges/destructiveChanges.xml
+          --wait ${{ inputs.WAIT }}
+          --test-level ${{ inputs.TEST_LEVEL }}
+          --verbose
+        )
+        if [ "${{ inputs.DRY_RUN }}" = "true" ]; then
+          deployFlags+=( --dry-run )
+        fi
+        sf project deploy start "${deployFlags[@]}"
